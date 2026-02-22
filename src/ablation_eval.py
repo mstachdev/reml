@@ -55,6 +55,32 @@ from reml import (
 # ---------------------------------------------------------------------------
 
 
+def _clone_layer(layer):
+    """Clone a nn.Linear layer, detaching from any computation graph.
+
+    copy.deepcopy fails on non-leaf tensors (after optimizer steps),
+    so we create a fresh layer and copy the detached parameter data.
+    """
+    new_layer = torch.nn.Linear(
+        layer.in_features, layer.out_features, bias=layer.bias is not None
+    )
+    with torch.no_grad():
+        new_layer.weight.copy_(layer.weight.detach())
+        if layer.bias is not None:
+            new_layer.bias.copy_(layer.bias.detach())
+    return new_layer
+
+
+def _clone_pool(pool):
+    """Create a safe deep copy of a LayerPool by cloning all layers."""
+    cloned_layers = [_clone_layer(l) for l in pool.layers]
+    new_pool = copy.copy(pool)  # shallow copy for metadata
+    new_pool.layers = cloned_layers
+    new_pool.initial_input_layer = _clone_layer(pool.initial_input_layer)
+    new_pool.initial_output_layer = _clone_layer(pool.initial_output_layer)
+    return new_pool
+
+
 def compose_network_from_pool(layer_pool, indices, config):
     """Build a torch.nn.ModuleList from pool using given layer indices.
 
@@ -62,7 +88,7 @@ def compose_network_from_pool(layer_pool, indices, config):
       [input_layer_idx, hidden_1_idx, ..., hidden_k_idx, output_layer_idx]
     Total length == config['n_layers_per_network']
     """
-    layers = torch.nn.ModuleList([copy.deepcopy(layer_pool.layers[i]) for i in indices])
+    layers = torch.nn.ModuleList([_clone_layer(layer_pool.layers[i]) for i in indices])
     return layers
 
 
@@ -108,7 +134,7 @@ def evaluate_composed_network(layers, eval_task, config, train_steps=100):
     Returns:
         losses: list of float MSE values at each step
     """
-    layers = copy.deepcopy(layers)
+    layers = torch.nn.ModuleList([_clone_layer(l) for l in layers])
     loss_fn = torch.nn.MSELoss()
     opt = torch.optim.Adam(layers.parameters(), lr=config["learning_rate"])
 
@@ -211,7 +237,7 @@ def run_ablation(
     pool = LayerPool(config=config)
     reml = REML(tasks=training_tasks, layer_pool=pool, run="ablation", config=config)
     reml.train()
-    trained_pool = copy.deepcopy(pool)
+    trained_pool = _clone_pool(pool)
     print("[ablation] REML training complete.")
 
     # Save trained pool

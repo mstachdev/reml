@@ -72,6 +72,22 @@ def get_default_config():
 generate_config = get_default_config
 
 
+def _clone_layer(layer):
+    """Clone a nn.Linear layer, detaching from any computation graph.
+
+    copy.deepcopy fails on non-leaf tensors (after optimizer steps),
+    so we create a fresh layer and copy the detached parameter data.
+    """
+    new_layer = torch.nn.Linear(
+        layer.in_features, layer.out_features, bias=layer.bias is not None
+    )
+    with torch.no_grad():
+        new_layer.weight.copy_(layer.weight.detach())
+        if layer.bias is not None:
+            new_layer.bias.copy_(layer.bias.detach())
+    return new_layer
+
+
 def set_seed(seed=None, config=None):
     if seed is None:
         seed = random.randint(1, 1000)
@@ -750,9 +766,9 @@ def run(config, experiments=None, seed=41):
             # save model, layers
             exp_string = "".join(f"{key}{value}" for key, value in exp.items())
             reml.model.save(os.path.join(path, f"model_{exp_string}"))
-            layers = copy.deepcopy(pool.layers)
-            layers.insert(0, pool.initial_input_layer)
-            layers.append(pool.initial_output_layer)
+            layers = [_clone_layer(l) for l in pool.layers]
+            layers.insert(0, _clone_layer(pool.initial_input_layer))
+            layers.append(_clone_layer(pool.initial_output_layer))
             torch.save(layers, os.path.join(path, f"layers_{exp_string}.pth"))
 
             # save return, loss, and error data across runs
@@ -818,9 +834,9 @@ def run(config, experiments=None, seed=41):
 
             # save model, layers
             reml.model.save(os.path.join(path, f"model_{run_num}"))
-            layers = copy.deepcopy(pool.layers)
-            layers.insert(0, pool.initial_input_layer)
-            layers.append(pool.initial_output_layer)
+            layers = [_clone_layer(l) for l in pool.layers]
+            layers.insert(0, _clone_layer(pool.initial_input_layer))
+            layers.append(_clone_layer(pool.initial_output_layer))
             torch.save(layers, os.path.join(path, f"layers_{run_num}.pth"))
 
             # save return, loss, and error data across runs
