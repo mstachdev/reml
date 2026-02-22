@@ -523,7 +523,7 @@ class InnerNetwork(gymnasium.Env, torch.nn.Module):
                 }
             )
 
-    def reset(self, seed=None) -> np.ndarray:
+    def reset(self, seed=None, options=None) -> np.ndarray:
         self.timestep = 0
         self.prev = defaultdict(lambda: None)
         self.curr = defaultdict(lambda: None)
