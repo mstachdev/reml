@@ -46,6 +46,7 @@ from reml import (
     generate_tasks,
     setup_path,
     LayerPool,
+    InnerNetwork,
     InnerNetworkTask,
     REML,
 )
@@ -163,21 +164,26 @@ def run_reml_composition(reml_model, layer_pool, eval_task, config):
     Returns indices chosen by the policy (list of ints).
     """
     import gymnasium
+    from sb3_contrib.common.wrappers import ActionMasker
 
-    env = gymnasium.wrappers.NormalizeObservation(
-        __import__("reml", fromlist=["InnerNetwork"]).InnerNetwork(
-            eval_task, layer_pool, config=config, epoch=0, calibration=False
-        )
+    inner = InnerNetwork(
+        eval_task, layer_pool, config=config, epoch=0, calibration=False
     )
+    env = gymnasium.wrappers.NormalizeObservation(inner)
+    if config.get("sb3_model") == "MaskablePPO":
+        env = ActionMasker(env, lambda env: env.unwrapped.action_masks())
+
     obs, _ = env.reset()
     done = False
     chosen_indices = []
     while not done:
-        action, _ = reml_model.predict(obs, deterministic=True)
+        # MaskablePPO requires action_masks kwarg at predict time
+        masks = inner.action_masks()
+        action, _ = reml_model.predict(obs, deterministic=True, action_masks=masks)
         obs, reward, done, truncated, info = env.step(action)
         chosen_indices.append(int(action))
     # The composed layers are now in the unwrapped InnerNetwork
-    return env.unwrapped.layers, chosen_indices
+    return inner.layers, chosen_indices
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +215,11 @@ def run_ablation(
     if config_overrides:
         for k, v in config_overrides.items():
             config[k] = v
+
+    # Recalculate derived config values after overrides
+    config["n_pool_hidden_layers"] = (
+        config["n_tasks"] * config["n_hidden_layers_per_network"]
+    )
 
     seed = config["seed"]
     set_seed(seed, config)

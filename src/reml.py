@@ -20,6 +20,7 @@ from typing import (
     Tuple,
 )
 import sb3_contrib
+from sb3_contrib import MaskablePPO
 import stable_baselines3
 
 # wandb is optional — only imported/used when use_wandb=True
@@ -59,7 +60,7 @@ def get_default_config():
         "meta_clip_range": 0.2,  # 0.1, 0.2 (default), 0.3
         "meta_n_steps": 2048,  # 5, 128, 512, 1024, 2048 (default)
         "meta_recurrent_n_steps": 128,  # 5, 128 (default), 512, 1024
-        "sb3_model": "PPO",
+        "sb3_model": "MaskablePPO",
         "data_dir": "data",
     }
     config["n_pool_hidden_layers"] = (
@@ -232,7 +233,7 @@ class LayerPool:
 
 class InnerNetworkAction(Enum):
     ADD = 1
-    ERROR = 2
+    ERROR = 2  # kept for backward compat; should no longer occur with action masking
 
 
 class InnerNetworkTask(Dataset):
@@ -329,13 +330,61 @@ class InnerNetwork(gymnasium.Env, torch.nn.Module):
 
         self.train()
         self.next_batch()
-        self.train_inner_network()
+        # Only do a forward pass at init to compute initial state;
+        # no inner training here so the policy's layer choices fully
+        # determine network quality.
+        self.forward()
+        self.eval_full_dataset()
         self.observation_space = gymnasium.spaces.box.Box(
             low=float("-inf"), high=float("inf"), shape=self.build_state().shape
         )
         self.action_space = gymnasium.spaces.discrete.Discrete(
             len(self.layer_pool.layers)
         )
+
+    def action_masks(self) -> np.ndarray:
+        """Return a boolean mask over the action space.
+
+        At each timestep, only structurally valid and non-duplicate layers
+        are allowed.  This eliminates wasted exploration on invalid actions.
+
+        Timestep 1: only input layers  (in_features == 1)
+        Timestep 2: only output layers (out_features == 1)
+        Timestep 3+: only hidden layers (40x40), not already in network
+        """
+        pool = self.layer_pool.layers
+        n = len(pool)
+        mask = np.zeros(n, dtype=bool)
+
+        layers_in_network = set(id(l) for l in self.layers)
+
+        next_ts = self.timestep + 1  # what the *next* step() call will see
+
+        if next_ts == 1:
+            # Need an input layer
+            for i, l in enumerate(pool):
+                if l.in_features == 1 and id(l) not in layers_in_network:
+                    mask[i] = True
+        elif next_ts == 2:
+            # Need an output layer
+            for i, l in enumerate(pool):
+                if l.out_features == 1 and id(l) not in layers_in_network:
+                    mask[i] = True
+        else:
+            # Need a hidden layer (not input, not output, not already used)
+            for i, l in enumerate(pool):
+                if (
+                    l.in_features != 1
+                    and l.out_features != 1
+                    and id(l) not in layers_in_network
+                ):
+                    mask[i] = True
+
+        # Fallback: if nothing is valid (shouldn't happen), allow everything
+        if not mask.any():
+            mask[:] = True
+
+        return mask
 
     def step(self, action: np.int64) -> Tuple[torch.Tensor, float, bool, dict]:
         assert action.shape == (), (
@@ -358,6 +407,9 @@ class InnerNetwork(gymnasium.Env, torch.nn.Module):
         else:
             self.forward()
 
+        # Evaluate on full dataset for a stable reward / state signal
+        self.eval_full_dataset()
+
         # calibration is finding the min and max loss values for the task to
         # scale the loss (and the reward) between 0 and 1 across tasks
         if self.calibration == True:
@@ -370,9 +422,10 @@ class InnerNetwork(gymnasium.Env, torch.nn.Module):
         reward = self.reward()
         self.log()
 
-        # update pool
-        for index, layer in zip(self.layers_pool_indices, self.layers[1:-1]):
-            self.layer_pool.layers[index] = layer
+        # update pool only at episode end so the pool is stable within an episode
+        if termination:
+            for index, layer in zip(self.layers_pool_indices, self.layers[1:-1]):
+                self.layer_pool.layers[index] = layer
 
         return (s_prime, reward, termination, False, {})
 
@@ -432,14 +485,27 @@ class InnerNetwork(gymnasium.Env, torch.nn.Module):
         else:
             self.curr["action_type"] = InnerNetworkAction.ERROR
 
-    def forward(self) -> None:
-        x = copy.deepcopy(self.curr["x"])
+    def _forward_pass(self, x):
+        """Run input through layers and return output."""
         for i in range(len(self.layers) - 1):
             x = torch.nn.functional.relu(self.layers[i](x))
-        self.curr["latent_space"] = x
-        self.curr["y_hat"] = self.layers[-1](x)
+        return self.layers[-1](x)
+
+    def forward(self) -> None:
+        x = copy.deepcopy(self.curr["x"])
+        self.curr["y_hat"] = self._forward_pass(x)
         self.curr["loss"] = self.loss_fn(self.curr["y"], self.curr["y_hat"])
         self.curr["loss"].backward()
+
+    def eval_full_dataset(self) -> None:
+        """Evaluate on the full dataset for a stable reward signal."""
+        x_all = self.task.data.view(-1, 1)
+        y_all = self.task.targets.view(-1, 1)
+        with torch.no_grad():
+            y_hat = self._forward_pass(x_all.clone())
+            loss = self.loss_fn(y_all, y_hat)
+        self.curr["y_hat"] = y_hat
+        self.curr["loss"] = loss
 
     def train_inner_network(self, steps=30) -> None:
         self.opt = torch.optim.Adam(self.layers.parameters(), lr=self.learning_rate)
@@ -492,19 +558,19 @@ class InnerNetwork(gymnasium.Env, torch.nn.Module):
         # credit those early actions more in the return
 
         if self.calibration:
-            scale_factor = 1
+            scale_factor = 1.0
         else:
             # "how bad" the initial layers are is a function of their loss
             # versus the min and max loss seen for task to ensure that credit
             # assignment skews towards ADD rather than TRAIN actions (because
             # Adam optimizer can train any set of layers to good performance
             # in few steps, but that's not the learning objective)
-            # e.g., with max loss for task=14,
-            # max loss for task=12, reduce each reward with a factor of
-            # 0.14 <- 14-12/14 = 2/14 = 0.14
             scale_factor = (
                 self.task_max_loss - self.local_max_loss
             ) / self.task_max_loss
+            # Clamp so the reward signal never vanishes (when local_max >=
+            # task_max the factor was <= 0, killing all learning signal)
+            scale_factor = max(0.1, min(scale_factor, 1.0))
 
         if self.curr["action_type"] == InnerNetworkAction.ERROR:
             reward = torch.tensor(-1)
@@ -561,7 +627,10 @@ class InnerNetwork(gymnasium.Env, torch.nn.Module):
         self.local_min_loss = float("inf")
         self.train()
         self.next_batch()
-        self.train_inner_network()
+        # Only forward pass at reset — no inner training so the policy's
+        # layer choices fully determine quality.
+        self.forward()
+        self.eval_full_dataset()
         return self.build_state(), None
 
 
@@ -583,7 +652,25 @@ class REML:
         # is replaced with set_env()
         dummy_env = self.make_env(tasks[0])
         use_custom_hyperparams = config.get("exp_file", "") != ""
-        if config["sb3_model"] == "PPO":
+        if config["sb3_model"] == "MaskablePPO":
+            # MaskablePPO from sb3-contrib: uses action_masks() from the
+            # environment to restrict the policy to valid actions only.
+            if use_custom_hyperparams:
+                self.model = MaskablePPO(
+                    "MlpPolicy",
+                    dummy_env,
+                    learning_rate=config["meta_learning_rate"],
+                    clip_range=config["meta_clip_range"],
+                    n_steps=config["meta_n_steps"],
+                    seed=config["seed"],
+                )
+            else:
+                self.model = MaskablePPO(
+                    "MlpPolicy",
+                    dummy_env,
+                    seed=config["seed"],
+                )
+        elif config["sb3_model"] == "PPO":
             if use_custom_hyperparams:
                 self.model = stable_baselines3.PPO(
                     "MlpPolicy",
@@ -623,15 +710,21 @@ class REML:
         return f"REML(model={self.config['sb3_model']})"
 
     def make_env(self, task, epoch=None, calibration=False) -> gymnasium.Env:
-        return gymnasium.wrappers.NormalizeObservation(
-            InnerNetwork(
-                task,
-                self.layer_pool,
-                config=self.config,
-                epoch=epoch,
-                calibration=calibration,
-            )
+        from sb3_contrib.common.wrappers import ActionMasker
+
+        inner = InnerNetwork(
+            task,
+            self.layer_pool,
+            config=self.config,
+            epoch=epoch,
+            calibration=calibration,
         )
+        env = gymnasium.wrappers.NormalizeObservation(inner)
+        # MaskablePPO needs action_masks() accessible through the wrapper.
+        # ActionMasker delegates to a callback; we point it at the inner env.
+        if self.config["sb3_model"] == "MaskablePPO":
+            env = ActionMasker(env, lambda env: env.unwrapped.action_masks())
+        return env
 
     def _inner_env(self):
         """Access the unwrapped InnerNetwork inside the NormalizeObservation wrapper."""
