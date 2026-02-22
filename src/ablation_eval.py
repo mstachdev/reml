@@ -149,8 +149,8 @@ def run_reml_composition(reml_model, layer_pool, eval_task, config):
         action, _ = reml_model.predict(obs, deterministic=True)
         obs, reward, done, truncated, info = env.step(action)
         chosen_indices.append(int(action))
-    # The composed layers are now in env.layers
-    return env.layers, chosen_indices
+    # The composed layers are now in the unwrapped InnerNetwork
+    return env.unwrapped.layers, chosen_indices
 
 
 # ---------------------------------------------------------------------------

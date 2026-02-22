@@ -617,6 +617,10 @@ class REML:
             )
         )
 
+    def _inner_env(self):
+        """Access the unwrapped InnerNetwork inside the NormalizeObservation wrapper."""
+        return self.env.unwrapped
+
     def calibrate(self):
         # get the min and max loss per task to min-max
         # scale across tasks so no one task dominates learning
@@ -626,11 +630,12 @@ class REML:
             self.env = self.make_env(task, calibration=True)
             self.model.set_env(self.env)
             self.model.learn(total_timesteps=self.config["timesteps"])
+            inner = self._inner_env()
             self.config["task_min_loss"][task.info["i"]] = min(
-                self.env.task_min_loss, self.config["task_min_loss"][task.info["i"]]
+                inner.task_min_loss, self.config["task_min_loss"][task.info["i"]]
             )
             self.config["task_max_loss"][task.info["i"]] = max(
-                self.env.task_max_loss, self.config["task_max_loss"][task.info["i"]]
+                inner.task_max_loss, self.config["task_max_loss"][task.info["i"]]
             )
 
     def train(self):
@@ -647,8 +652,9 @@ class REML:
                 self.model.learn(total_timesteps=self.config["timesteps"])
 
                 # update min and max loss for task
-                local_min_loss = self.env.local_min_loss
-                local_max_loss = self.env.local_max_loss
+                inner = self._inner_env()
+                local_min_loss = inner.local_min_loss
+                local_max_loss = inner.local_max_loss
                 self.config["task_min_loss"][self.task.info["i"]] = min(
                     local_min_loss, self.config["task_min_loss"][self.task.info["i"]]
                 )
@@ -658,13 +664,13 @@ class REML:
 
                 # track reward, loss, and errors for plots
                 self.task_rewards_per_episode[str(self.task.info["i"])] = (
-                    self.env.rewards_per_episode
+                    inner.rewards_per_episode
                 )  # [ [sum of rewards for episode 1], [episode 2], ..., [episode n] ]
                 self.task_losses_per_episode[str(self.task.info["i"])] = (
-                    self.env.losses_per_episode
+                    inner.losses_per_episode
                 )
                 self.task_errors_per_episode[str(self.task.info["i"])] = (
-                    self.env.errors_per_episode
+                    inner.errors_per_episode
                 )
 
 
