@@ -29,6 +29,7 @@ import json
 import random
 import argparse
 import datetime
+from collections import defaultdict
 import numpy as np
 import torch
 import matplotlib
